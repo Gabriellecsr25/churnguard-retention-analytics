@@ -2,564 +2,624 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
-from datetime import datetime
+from sklearn.metrics import (
+    precision_score, recall_score, f1_score,
+    confusion_matrix, classification_report
+)
 
-# =========================================================
-# Configurações gerais
-# =========================================================
+# =========================
+# Configuração visual básica
+# =========================
 st.set_page_config(
-    page_title="ChurnGuard • Retenção & Prioridades",
+    page_title="ChurnGuard | Retenção & Crescimento",
     page_icon="📉",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-st.markdown(
-    """
-    <style>
-      .small-muted { color: #6b7280; font-size: 0.92rem; }
-      .hr { border-top: 1px solid #e5e7eb; margin: 1rem 0; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+def inject_css():
+    st.markdown(
+        """
+        <style>
+          :root {
+            --card-bg: rgba(255,255,255,0.04);
+            --card-border: rgba(255,255,255,0.10);
+            --muted: rgba(255,255,255,0.70);
+          }
+          .block-container { padding-top: 1.2rem; }
+          .small-muted { color: var(--muted); font-size: 0.95rem; }
+          .hr { border-top: 1px solid rgba(255,255,255,0.10); margin: 1rem 0; }
 
-# =========================================================
-# Carregar artefatos do modelo
-# =========================================================
+          .card {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 16px;
+            padding: 16px 16px;
+          }
+          .kpi-title { font-size: 0.85rem; color: var(--muted); margin-bottom: 6px; }
+          .kpi-value { font-size: 1.8rem; font-weight: 700; line-height: 1; }
+          .kpi-sub { font-size: 0.9rem; color: var(--muted); margin-top: 6px; }
+
+          .badge {
+            display: inline-block;
+            padding: 6px 10px;
+            border-radius: 999px;
+            border: 1px solid rgba(255,255,255,0.15);
+            background: rgba(255,255,255,0.04);
+            font-size: 0.85rem;
+            color: var(--muted);
+          }
+
+          .section-title {
+            font-size: 1.25rem;
+            font-weight: 700;
+            margin: 0.2rem 0 0.8rem 0;
+          }
+
+          /* deixa os radio/inputs com cara mais “produto” */
+          div[data-baseweb="select"] > div,
+          div[data-baseweb="input"] > div,
+          div[data-baseweb="textarea"] > div {
+            border-radius: 12px !important;
+          }
+          .stButton>button {
+            border-radius: 12px;
+            padding: 0.6rem 1rem;
+            font-weight: 600;
+          }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+inject_css()
+
+# =========================
+# Carregamento de recursos
+# =========================
 @st.cache_resource
-def load_artifacts():
+def load_model_and_columns():
     model = joblib.load("modelo_churn.pkl")
-    cols = joblib.load("colunas_modelo.pkl")
+    cols = joblib.load("colunas_modelo.pkl")  # lista de colunas após o preprocess
     return model, cols
 
-model, model_columns = load_artifacts()
-
-# =========================================================
-# Dataset para dashboard (opcional)
-# =========================================================
 @st.cache_data
-def load_dataset(path="WA_Fn-UseC_-Telco-Customer-Churn.csv"):
-    df = pd.read_csv(path)
-    df["TotalCharges"] = pd.to_numeric(df["TotalCharges"], errors="coerce")
+def load_telco_dataset():
+    # Dataset original do seu repo
+    df = pd.read_csv("WA_Fn-UseC_-Telco-Customer-Churn.csv")
+    # ajustes comuns
+    if "TotalCharges" in df.columns:
+        df["TotalCharges"] = pd.to_numeric(df["TotalCharges"], errors="coerce")
     df = df.dropna(subset=["TotalCharges"]).copy()
-    df["Churn_num"] = df["Churn"].map({"No": 0, "Yes": 1})
     return df
 
-try:
-    df_data = load_dataset()
-    dataset_loaded = True
-except Exception:
-    df_data = None
-    dataset_loaded = False
-
-# =========================================================
-# Estado do app
-# =========================================================
-if "history" not in st.session_state:
-    st.session_state.history = []
-
-if "last_batch" not in st.session_state:
-    st.session_state.last_batch = None
-
-# =========================================================
-# Helpers
-# =========================================================
-FEATURES_RAW = [
-    "gender", "SeniorCitizen", "Partner", "Dependents", "tenure",
-    "PhoneService", "MultipleLines", "InternetService",
-    "OnlineSecurity", "OnlineBackup", "DeviceProtection", "TechSupport",
-    "StreamingTV", "StreamingMovies", "Contract", "PaperlessBilling",
-    "PaymentMethod", "MonthlyCharges", "TotalCharges"
-]
-
-def safe_to_numeric(series, default=np.nan):
-    out = pd.to_numeric(series, errors="coerce")
-    return out.fillna(default)
-
-def build_encoded(df_raw: pd.DataFrame) -> pd.DataFrame:
-    df_encoded = pd.get_dummies(df_raw, drop_first=True)
-    df_encoded = df_encoded.reindex(columns=model_columns, fill_value=0)
-    return df_encoded
-
-def risk_bucket(prob: float) -> str:
-    if prob < 0.30:
-        return "Baixo"
-    if prob < 0.60:
-        return "Médio"
-    return "Alto"
-
-def risk_emoji(bucket: str) -> str:
-    return {"Baixo": "🟢", "Médio": "🟡", "Alto": "🔴"}.get(bucket, "🟡")
-
-def ensure_required_columns(df: pd.DataFrame):
-    missing = [c for c in FEATURES_RAW if c not in df.columns]
-    return (len(missing) == 0, missing)
-
-def priority_score(prob: float, tenure: float, contract: str, monthly: float) -> float:
-    score = prob * 100
-    if tenure <= 6: score += 10
-    elif tenure <= 12: score += 6
-    elif tenure <= 24: score += 3
-
-    if contract == "Month-to-month": score += 8
-    elif contract == "One year": score += 2
-
-    if monthly >= 90: score += 6
-    elif monthly >= 70: score += 3
-
-    return float(np.clip(score, 0, 100))
-
-def playbook_row(prob: float, contract: str, tenure: int, monthly: float, payment: str) -> dict:
-    bucket = risk_bucket(prob)
-
-    action = "Acompanhar"
-    offer = "Comunicação padrão"
-    channel = "E-mail / In-app"
-    reason = "Risco baixo"
-
-    if bucket == "Médio":
-        action = "Contato proativo"
-        channel = "WhatsApp / Telefone"
-        offer = "Benefício leve (upgrade/bonus)"
-        reason = "Risco médio — agir antes do cancelamento"
-    elif bucket == "Alto":
-        action = "Retenção imediata"
-        channel = "Telefone (prioridade) + WhatsApp"
-        offer = "Oferta direcionada (desconto/upgrade/contrato)"
-        reason = "Risco alto — evitar churn nas próximas semanas"
-
-    if contract == "Month-to-month" and bucket in ["Médio", "Alto"]:
-        offer = "Incentivo para migrar para contrato anual (reduz churn)"
-        reason += " • contrato mês a mês"
-    if tenure <= 6 and bucket in ["Médio", "Alto"]:
-        reason += " • cliente novo (tenure baixo)"
-    if monthly >= 80 and bucket in ["Médio", "Alto"]:
-        reason += " • cobrança alta"
-    if payment == "Electronic check" and bucket in ["Médio", "Alto"]:
-        reason += " • método com churn alto (Electronic check)"
-
-    return {
-        "acao": action,
-        "canal": channel,
-        "oferta_sugerida": offer,
-        "racional": reason
-    }
-
-def explain_logreg_top_factors(X_row: pd.DataFrame, top_n: int = 6):
-    if not hasattr(model, "coef_"):
-        return pd.DataFrame(columns=["Fator", "Impacto (aprox.)"])
-    coefs = pd.Series(model.coef_[0], index=model_columns)
-    row = X_row.iloc[0]
-    contrib = (row * coefs).sort_values(ascending=False)
-    contrib = contrib[contrib != 0].head(top_n)
-    if contrib.empty:
-        return pd.DataFrame(columns=["Fator", "Impacto (aprox.)"])
-    return pd.DataFrame({
-        "Fator": contrib.index.str.replace("_", " ").str.replace("-", " "),
-        "Impacto (aprox.)": contrib.values.round(4)
-    })
-
-def template_csv_bytes():
-    df_tpl = pd.DataFrame(columns=["customerID"] + FEATURES_RAW)
-    df_tpl.loc[0] = [
-        "CUST-0001",
-        "Female", 0, "Yes", "No", 12,
-        "Yes", "No", "DSL",
-        "Yes", "Yes", "Yes", "Yes",
-        "No", "No", "Month-to-month", "Yes",
-        "Electronic check", 75.0, 1200.0
-    ]
-    return df_tpl.to_csv(index=False).encode("utf-8")
-
-# =========================================================
-# Sidebar
-# =========================================================
-with st.sidebar:
+def safe_load():
     try:
-        st.image("logo.png", use_container_width=True)  # imagem ainda aceita use_container_width
-    except Exception:
-        pass
+        model, model_cols = load_model_and_columns()
+    except Exception as e:
+        st.error("Não consegui carregar o modelo/colunas. Verifique se 'modelo_churn.pkl' e 'colunas_modelo.pkl' estão no repositório.")
+        st.code(str(e))
+        st.stop()
 
-    st.markdown("## 📉 ChurnGuard")
-    st.caption("Retenção • Priorização • Batch scoring")
+    try:
+        base = load_telco_dataset()
+    except Exception as e:
+        st.warning("Não consegui carregar o CSV Telco automaticamente. O app continua, mas algumas páginas (métricas/EDA) vão ficar limitadas.")
+        base = None
 
-    threshold = st.slider(
-        "Limiar (ponto de corte)",
-        min_value=0.10, max_value=0.90, value=0.50, step=0.05,
-        help="Abaixo do limiar = não churn. Acima = churn."
+    return model, model_cols, base
+
+model, model_cols, telco_df = safe_load()
+
+# =========================
+# Utilitários de produto
+# =========================
+def kpi_card(title, value, sub=""):
+    st.markdown(
+        f"""
+        <div class="card">
+          <div class="kpi-title">{title}</div>
+          <div class="kpi-value">{value}</div>
+          <div class="kpi-sub">{sub}</div>
+        </div>
+        """,
+        unsafe_allow_html=True
     )
 
-    st.markdown("---")
-    menu = st.radio(
+def to_model_frame(raw_df: pd.DataFrame, expected_cols: list[str]) -> pd.DataFrame:
+    """
+    Ajusta o dataframe para ter exatamente as colunas esperadas pelo modelo,
+    criando colunas faltantes com 0 e removendo extras.
+    """
+    df = raw_df.copy()
+    for c in expected_cols:
+        if c not in df.columns:
+            df[c] = 0
+    df = df[expected_cols]
+    return df
+
+def extract_feature_importance(model, feature_names):
+    """
+    Tenta obter top features para modelos com:
+    - feature_importances_ (árvores)
+    - coef_ (regressão logística)
+    """
+    if hasattr(model, "feature_importances_"):
+        imp = model.feature_importances_
+        s = pd.Series(imp, index=feature_names).sort_values(ascending=False)
+        return s
+    if hasattr(model, "coef_"):
+        coef = model.coef_
+        # binário: shape (1, n_features)
+        if len(coef.shape) == 2 and coef.shape[0] == 1:
+            coef = coef[0]
+        s = pd.Series(np.abs(coef), index=feature_names).sort_values(ascending=False)
+        return s
+    return None
+
+def predict_proba_from_input(df_input_processed: pd.DataFrame) -> np.ndarray:
+    if hasattr(model, "predict_proba"):
+        return model.predict_proba(df_input_processed)[:, 1]
+    # fallback: decision_function -> sigmoid aproximado
+    if hasattr(model, "decision_function"):
+        z = model.decision_function(df_input_processed)
+        return 1 / (1 + np.exp(-z))
+    # último caso: só predict (0/1)
+    return model.predict(df_input_processed).astype(float)
+
+# =========================
+# Traduções (UI PT -> valores EN que o modelo espera)
+# =========================
+UI = {
+    "Sexo": {"Feminino": "Female", "Masculino": "Male"},
+    "Idoso (Senior)": {"Não": 0, "Sim": 1},
+    "Tem parceiro(a)": {"Não": "No", "Sim": "Yes"},
+    "Tem dependentes": {"Não": "No", "Sim": "Yes"},
+    "Serviço de telefone": {"Não": "No", "Sim": "Yes"},
+    "Múltiplas linhas": {"Não": "No", "Sim": "Yes", "Sem telefone": "No phone service"},
+    "Internet": {"DSL": "DSL", "Fibra": "Fiber optic", "Sem internet": "No"},
+    "Segurança online": {"Não": "No", "Sim": "Yes", "Sem internet": "No internet service"},
+    "Backup online": {"Não": "No", "Sim": "Yes", "Sem internet": "No internet service"},
+    "Proteção do dispositivo": {"Não": "No", "Sim": "Yes", "Sem internet": "No internet service"},
+    "Suporte técnico": {"Não": "No", "Sim": "Yes", "Sem internet": "No internet service"},
+    "TV por streaming": {"Não": "No", "Sim": "Yes", "Sem internet": "No internet service"},
+    "Filmes por streaming": {"Não": "No", "Sim": "Yes", "Sem internet": "No internet service"},
+    "Contrato": {"Mensal": "Month-to-month", "1 ano": "One year", "2 anos": "Two year"},
+    "Fatura digital": {"Não": "No", "Sim": "Yes"},
+    "Forma de pagamento": {
+        "Boleto eletrônico": "Electronic check",
+        "Cheque enviado": "Mailed check",
+        "Cartão (automático)": "Credit card (automatic)",
+        "Transferência (automática)": "Bank transfer (automatic)"
+    }
+}
+
+def build_single_customer_input():
+    # Campos essenciais do dataset original
+    col1, col2 = st.columns(2)
+
+    with col1:
+        gender_pt = st.selectbox("Sexo", list(UI["Sexo"].keys()))
+        senior_pt = st.selectbox("Idoso (Senior)", list(UI["Idoso (Senior)"].keys()))
+        partner_pt = st.selectbox("Tem parceiro(a)", list(UI["Tem parceiro(a)"].keys()))
+        dependents_pt = st.selectbox("Tem dependentes", list(UI["Tem dependentes"].keys()))
+        tenure = st.number_input("Tempo de casa (tenure em meses)", min_value=0, max_value=200, value=12, step=1)
+
+    with col2:
+        phone_pt = st.selectbox("Serviço de telefone", list(UI["Serviço de telefone"].keys()))
+        multilines_pt = st.selectbox("Múltiplas linhas", list(UI["Múltiplas linhas"].keys()))
+        internet_pt = st.selectbox("Internet", list(UI["Internet"].keys()))
+        contract_pt = st.selectbox("Contrato", list(UI["Contrato"].keys()))
+        paperless_pt = st.selectbox("Fatura digital", list(UI["Fatura digital"].keys()))
+
+    col3, col4 = st.columns(2)
+    with col3:
+        onsec_pt = st.selectbox("Segurança online", list(UI["Segurança online"].keys()))
+        onbackup_pt = st.selectbox("Backup online", list(UI["Backup online"].keys()))
+        devprot_pt = st.selectbox("Proteção do dispositivo", list(UI["Proteção do dispositivo"].keys()))
+        tech_pt = st.selectbox("Suporte técnico", list(UI["Suporte técnico"].keys()))
+
+    with col4:
+        tv_pt = st.selectbox("TV por streaming", list(UI["TV por streaming"].keys()))
+        movies_pt = st.selectbox("Filmes por streaming", list(UI["Filmes por streaming"].keys()))
+        pay_pt = st.selectbox("Forma de pagamento", list(UI["Forma de pagamento"].keys()))
+        monthly = st.number_input("Mensalidade (MonthlyCharges)", min_value=0.0, max_value=500.0, value=75.0, step=1.0)
+        total = st.number_input("Total pago (TotalCharges)", min_value=0.0, max_value=100000.0, value=1200.0, step=10.0)
+
+    # Monta registro no formato original (EN), como no dataset
+    record = {
+        "gender": UI["Sexo"][gender_pt],
+        "SeniorCitizen": UI["Idoso (Senior)"][senior_pt],
+        "Partner": UI["Tem parceiro(a)"][partner_pt],
+        "Dependents": UI["Tem dependentes"][dependents_pt],
+        "tenure": tenure,
+        "PhoneService": UI["Serviço de telefone"][phone_pt],
+        "MultipleLines": UI["Múltiplas linhas"][multilines_pt],
+        "InternetService": UI["Internet"][internet_pt],
+        "OnlineSecurity": UI["Segurança online"][onsec_pt],
+        "OnlineBackup": UI["Backup online"][onbackup_pt],
+        "DeviceProtection": UI["Proteção do dispositivo"][devprot_pt],
+        "TechSupport": UI["Suporte técnico"][tech_pt],
+        "StreamingTV": UI["TV por streaming"][tv_pt],
+        "StreamingMovies": UI["Filmes por streaming"][movies_pt],
+        "Contract": UI["Contrato"][contract_pt],
+        "PaperlessBilling": UI["Fatura digital"][paperless_pt],
+        "PaymentMethod": UI["Forma de pagamento"][pay_pt],
+        "MonthlyCharges": monthly,
+        "TotalCharges": total,
+    }
+    return pd.DataFrame([record])
+
+# =========================
+# Estado (memória do app)
+# =========================
+if "threshold" not in st.session_state:
+    st.session_state.threshold = 0.50
+
+if "last_batch_scored" not in st.session_state:
+    st.session_state.last_batch_scored = None  # dataframe com score
+
+if "sim_history" not in st.session_state:
+    st.session_state.sim_history = []  # lista de dicts
+
+# =========================
+# Sidebar - Identidade + Navegação
+# =========================
+with st.sidebar:
+    st.markdown("### ChurnGuard")
+    st.markdown('<span class="badge">Retenção • Priorização • Crescimento</span>', unsafe_allow_html=True)
+    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
+
+    st.markdown("**Limiar de decisão (ponto de corte)**")
+    st.session_state.threshold = st.slider("", 0.05, 0.95, float(st.session_state.threshold), 0.01)
+    st.caption("Quanto maior o limiar, mais ‘rigoroso’ você fica para chamar alguém de risco.")
+
+    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
+
+    page = st.radio(
         "Navegação",
-        ["🏠 Visão geral", "📥 Batch scoring (CSV)", "📌 Plano de Ação", "🧪 Simulador (1 cliente)", "📊 Dashboard", "🗂 Histórico"],
+        [
+            "📊 Visão Executiva",
+            "📥 Upload de Base",
+            "🎯 Priorização Inteligente",
+            "🧪 Simulação Individual",
+            "💰 Impacto Financeiro",
+            "📈 Análise Estratégica",
+            "🗂 Histórico",
+        ],
+        label_visibility="visible"
     )
 
-    st.markdown("---")
-    st.download_button(
-        "⬇️ Baixar CSV modelo (template)",
-        data=template_csv_bytes(),
-        file_name="template_clientes_churn.csv",
-        mime="text/csv",
-        width="stretch"
-    )
+# =========================
+# Páginas
+# =========================
+def page_executiva():
+    st.title("ChurnGuard — Retenção & Crescimento")
+    st.markdown('<p class="small-muted">Da previsão de churn à priorização e impacto financeiro — com narrativa executiva.</p>', unsafe_allow_html=True)
+    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
-# =========================================================
-# Header
-# =========================================================
-st.markdown("# ChurnGuard — Previsão de Cancelamento")
-st.markdown('<div class="small-muted">Aplicação operacional: upload de base → churn → ranking → playbook → export para retenção.</div>', unsafe_allow_html=True)
-st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
-
-# =========================================================
-# 1) Visão geral
-# =========================================================
-if menu == "🏠 Visão geral":
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Threshold", f"{threshold:.2f}")
-    c2.metric("Módulo", "Batch")
-    c3.metric("Saída", "CSV pronto")
-    c4.metric("Playbook", "Ativo")
+    with c1:
+        kpi_card("Limiar atual", f"{st.session_state.threshold:.2f}", "Ponto de corte para classificar risco")
+    with c2:
+        kpi_card("Modo", "Produto", "Fluxo: Upload → Ranking → Ação → ROI")
+    with c3:
+        status = "Pronto" if st.session_state.last_batch_scored is not None else "Aguardando"
+        kpi_card("Base carregada", status, "Use Upload de Base para começar")
+    with c4:
+        kpi_card("Saída", "CSV + Ações", "Ranking com recomendações")
 
-    st.subheader("O que este produto entrega")
-    st.write(
-        "✅ Modelo treinado + app interativo\n"
-        "✅ Upload de CSV de clientes e scoring em lote\n"
-        "✅ Ranking Top 50 por prioridade de ação\n"
-        "✅ Filtros operacionais para o time de retenção\n"
-        "✅ Playbook de retenção (ação, canal, oferta)\n"
-        "✅ Export do resultado (top50 e completo)\n"
-        "✅ Plano de Ação (contatos do dia + copiar lista + impacto estimado + export alto risco)"
+    st.markdown("### O que este produto entrega")
+    st.markdown(
+        """
+        - **Prioriza clientes por risco** usando modelo treinado  
+        - **Transforma score em ação** (segmento, canal, oferta sugerida)  
+        - **Compara cenários** (limiar x precisão x ROI)  
+        - **Mostra impacto financeiro estimado** (receita salva)  
+        """
     )
 
-# =========================================================
-# 2) Batch scoring
-# =========================================================
-elif menu == "📥 Batch scoring (CSV)":
-    st.subheader("📥 Batch scoring — upload de base e priorização automática")
+def page_upload():
+    st.header("📥 Upload de Base — entrada operacional")
+    st.markdown('<p class="small-muted">Envie um CSV com as colunas do Telco (pode ter extras). A gente calcula o risco e guarda para priorização.</p>', unsafe_allow_html=True)
 
-    with st.expander("✅ Formato esperado do CSV (colunas obrigatórias)"):
-        st.code(", ".join(FEATURES_RAW), language="text")
-        st.caption("Você pode incluir `customerID` (opcional). Colunas extras ok.")
-
-    uploaded = st.file_uploader("Upload do CSV de clientes", type=["csv"])
-
+    uploaded = st.file_uploader("Envie seu CSV", type=["csv"])
     if uploaded is None:
-        st.info("Envie um CSV para calcular churn e gerar ranking.")
-        st.stop()
+        st.info("Dica: se você não tiver CSV agora, use o dataset Telco do repositório para testar na página Análise Estratégica.")
+        return
 
-    df_in = pd.read_csv(uploaded).copy()
+    df = pd.read_csv(uploaded)
+    # ajustes comuns
+    if "TotalCharges" in df.columns:
+        df["TotalCharges"] = pd.to_numeric(df["TotalCharges"], errors="coerce")
 
-    has_id = "customerID" in df_in.columns
-    if has_id:
-        df_ids = df_in[["customerID"]].copy()
-    else:
-        df_ids = pd.DataFrame({"customerID": [f"CLIENTE-{i+1:05d}" for i in range(len(df_in))]})
+    st.write("Prévia da base:")
+    st.dataframe(df.head(20), use_container_width=True)
 
-    if "Churn" in df_in.columns:
-        df_in = df_in.drop(columns=["Churn"])
+    st.success("Base carregada. Agora vá em **🎯 Priorização Inteligente** para gerar ranking e ações.")
 
-    ok, missing = ensure_required_columns(df_in)
-    if not ok:
-        st.error("Seu CSV está faltando colunas obrigatórias:")
-        st.write(missing)
-        st.stop()
+    # guarda no estado
+    st.session_state.upload_df = df
 
-    df_in["TotalCharges"] = safe_to_numeric(df_in["TotalCharges"], default=np.nan)
-    before = len(df_in)
-    df_scoring = df_in.dropna(subset=["TotalCharges"]).copy()
-    removed = before - len(df_scoring)
-    if removed > 0:
-        st.warning(f"Removi {removed} linhas com TotalCharges inválido/vazio (igual no treino).")
+def page_priorizacao():
+    st.header("🎯 Priorização Inteligente — ranking + playbook")
+    st.markdown('<p class="small-muted">Transforme probabilidade de churn em lista de ação (quem atacar primeiro e como).</p>', unsafe_allow_html=True)
 
-    df_scoring["SeniorCitizen"] = safe_to_numeric(df_scoring["SeniorCitizen"], default=0).astype(int)
-    df_scoring["tenure"] = safe_to_numeric(df_scoring["tenure"], default=0).astype(int)
-    df_scoring["MonthlyCharges"] = safe_to_numeric(df_scoring["MonthlyCharges"], default=0.0).astype(float)
-    df_scoring["TotalCharges"] = safe_to_numeric(df_scoring["TotalCharges"], default=np.nan).astype(float)
+    if "upload_df" not in st.session_state or st.session_state.upload_df is None:
+        st.warning("Você ainda não enviou uma base. Vá em **📥 Upload de Base**.")
+        return
 
-    X = build_encoded(df_scoring[FEATURES_RAW])
-    probs = model.predict_proba(X)[:, 1]
+    df = st.session_state.upload_df.copy()
 
-    df_out = df_scoring.copy()
-    df_out.insert(0, "customerID", df_ids.loc[df_scoring.index, "customerID"].values)
+    # Pré-processamento rápido: one-hot no padrão do treino (assumindo que colunas_modelo.pkl é o pós-encoding)
+    # Aqui usamos get_dummies para aproximar o pipeline.
+    # Se seu modelo foi treinado com pipeline diferente, a gente ajusta depois.
+    cat_cols = df.select_dtypes(include=["object"]).columns.tolist()
+    df_enc = pd.get_dummies(df, columns=cat_cols, drop_first=False)
 
-    df_out["prob_churn"] = probs
-    df_out["classe_predita"] = (df_out["prob_churn"] >= threshold).astype(int)
-    df_out["risco"] = df_out["prob_churn"].apply(risk_bucket)
+    X = to_model_frame(df_enc, model_cols)
+    proba = predict_proba_from_input(X)
 
-    df_out["prioridade_score"] = df_out.apply(
-        lambda r: priority_score(r["prob_churn"], r["tenure"], r["Contract"], r["MonthlyCharges"]),
-        axis=1
+    out = df.copy()
+    out["risco_churn"] = proba
+    out["classificacao"] = np.where(out["risco_churn"] >= st.session_state.threshold, "ALTO RISCO", "baixo risco")
+
+    # Playbook simples (negócio) — você pode refinar depois
+    def suggest_action(row):
+        risk = row["risco_churn"]
+        monthly = row["MonthlyCharges"] if "MonthlyCharges" in row else np.nan
+        contract = row["Contract"] if "Contract" in row else ""
+        if risk >= 0.80:
+            return "Oferta forte + contato humano (prioridade máxima)"
+        if risk >= 0.65:
+            return "Retenção: upgrade/benefício + contato (WhatsApp/telefone)"
+        if risk >= st.session_state.threshold:
+            if contract == "Month-to-month":
+                return "Incentivo para migrar para contrato anual"
+            return "Ajuste de plano + benefício leve"
+        return "Acompanhamento (nurturing) / sem ação"
+
+    out["acao_recomendada"] = out.apply(suggest_action, axis=1)
+
+    out = out.sort_values("risco_churn", ascending=False).reset_index(drop=True)
+
+    st.session_state.last_batch_scored = out
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        kpi_card("Clientes na base", f"{len(out):,}".replace(",", "."), "Total avaliados")
+    with c2:
+        high = (out["classificacao"] == "ALTO RISCO").sum()
+        kpi_card("Alto risco", f"{high:,}".replace(",", "."), "Acima do limiar")
+    with c3:
+        kpi_card("Top prioridade", "Top 50", "Lista pronta para operação")
+
+    st.markdown("### Ranking (Top 50)")
+    st.dataframe(out.head(50), use_container_width=True)
+
+    st.download_button(
+        "⬇️ Baixar ranking completo (CSV)",
+        data=out.to_csv(index=False).encode("utf-8"),
+        file_name="churnguard_ranking.csv",
+        mime="text/csv"
     )
 
-    pb = df_out.apply(
-        lambda r: playbook_row(r["prob_churn"], r["Contract"], int(r["tenure"]), float(r["MonthlyCharges"]), r["PaymentMethod"]),
-        axis=1
-    )
-    df_out["acao"] = pb.apply(lambda d: d["acao"])
-    df_out["canal"] = pb.apply(lambda d: d["canal"])
-    df_out["oferta_sugerida"] = pb.apply(lambda d: d["oferta_sugerida"])
-    df_out["racional"] = pb.apply(lambda d: d["racional"])
+def page_simulacao():
+    st.header("🧪 Simulação Individual — cliente único")
+    st.markdown('<p class="small-muted">Preencha os dados do cliente e veja risco + recomendação. Tudo em português (sem quebrar o modelo).</p>', unsafe_allow_html=True)
 
-    ordem = {"Alto": 0, "Médio": 1, "Baixo": 2}
-    df_out["_ordem"] = df_out["risco"].map(ordem)
-    df_out = df_out.sort_values(by=["_ordem", "prioridade_score", "prob_churn"], ascending=[True, False, False]).drop(columns=["_ordem"])
+    df_one = build_single_customer_input()
 
-    st.session_state.last_batch = df_out.copy()
+    # one-hot igual ao batch
+    df_enc = pd.get_dummies(df_one, columns=df_one.select_dtypes(include=["object"]).columns.tolist(), drop_first=False)
+    X = to_model_frame(df_enc, model_cols)
+
+    if st.button("✅ Calcular risco"):
+        proba = float(predict_proba_from_input(X)[0])
+        label = "ALTO RISCO" if proba >= st.session_state.threshold else "baixo risco"
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            kpi_card("Risco de churn", f"{proba:.2%}", "Probabilidade estimada")
+        with c2:
+            kpi_card("Classificação", label, f"Limiar: {st.session_state.threshold:.2f}")
+        with c3:
+            kpi_card("Recomendação", "Ação sugerida", "Baseada no nível de risco")
+
+        if proba >= 0.80:
+            st.info("Ação sugerida: **contato humano + oferta forte + resolver fricções** (prioridade máxima).")
+        elif proba >= st.session_state.threshold:
+            st.info("Ação sugerida: **benefício / upgrade / migração de contrato** (prioridade alta).")
+        else:
+            st.info("Ação sugerida: **nurturing** (acompanhar, ofertas leves, melhoria de experiência).")
+
+        # salva histórico
+        st.session_state.sim_history.append({
+            "risco_churn": proba,
+            "classificacao": label,
+            "limiar": st.session_state.threshold
+        })
+
+def page_impacto():
+    st.header("💰 Impacto Financeiro — estimativa de receita salva")
+    st.markdown('<p class="small-muted">Aqui é onde você vira “contratável”: traduz modelo em dinheiro.</p>', unsafe_allow_html=True)
+
+    if st.session_state.last_batch_scored is None:
+        st.warning("Você ainda não gerou um ranking. Vá em **🎯 Priorização Inteligente**.")
+        return
+
+    out = st.session_state.last_batch_scored.copy()
+
+    st.markdown("### Premissas (ajuste como em um caso real)")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        horizonte_meses = st.number_input("Horizonte (meses)", 1, 36, 12, 1)
+    with c2:
+        taxa_sucesso = st.number_input("Taxa de sucesso da ação (%)", 1, 100, 20, 1) / 100
+    with c3:
+        custo_por_acao = st.number_input("Custo por ação (R$)", 0.0, 500.0, 12.0, 1.0)
+    with c4:
+        qtd_acoes = st.number_input("Qtd. de clientes que você consegue acionar", 1, 5000, 300, 10)
+
+    # pega top N de alto risco
+    alto = out[out["classificacao"] == "ALTO RISCO"].head(int(qtd_acoes)).copy()
+    if "MonthlyCharges" not in alto.columns:
+        st.error("Sua base não tem 'MonthlyCharges'. Sem isso não dá para estimar receita salva.")
+        return
+
+    receita_potencial = (alto["MonthlyCharges"].fillna(0).sum() * horizonte_meses) * taxa_sucesso
+    custo_total = len(alto) * custo_por_acao
+    roi = (receita_potencial - custo_total) / (custo_total + 1e-9)
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        kpi_card("Receita salva estimada", f"R$ {receita_potencial:,.0f}".replace(",", "."), f"{len(alto)} ações • {int(taxa_sucesso*100)}% sucesso")
+    with c2:
+        kpi_card("Custo total estimado", f"R$ {custo_total:,.0f}".replace(",", "."), "Custo operacional / campanhas")
+    with c3:
+        kpi_card("ROI estimado", f"{roi:.1f}x", "Retorno sobre o investimento")
+
+    st.markdown("### Lista de ações (amostra)")
+    st.dataframe(alto.head(30), use_container_width=True)
+
+def page_analise():
+    st.header("📈 Análise Estratégica — métricas + drivers + cenários")
+    st.markdown('<p class="small-muted">Aqui você mostra maturidade: qualidade do modelo + explicabilidade + trade-off do limiar.</p>', unsafe_allow_html=True)
+
+    if telco_df is None:
+        st.warning("Sem o CSV Telco carregado. Confirme se 'WA_Fn-UseC_-Telco-Customer-Churn.csv' está no repo.")
+        return
+
+    df = telco_df.copy()
+    if "Churn" not in df.columns:
+        st.error("O dataset precisa da coluna 'Churn'.")
+        return
+
+    y = (df["Churn"] == "Yes").astype(int)
+
+    X_raw = df.drop(columns=["Churn"])
+    # remove id se existir
+    if "customerID" in X_raw.columns:
+        X_raw = X_raw.drop(columns=["customerID"])
+
+    cat_cols = X_raw.select_dtypes(include=["object"]).columns.tolist()
+    X_enc = pd.get_dummies(X_raw, columns=cat_cols, drop_first=False)
+    X = to_model_frame(X_enc, model_cols)
+
+    proba = predict_proba_from_input(X)
+    y_pred = (proba >= st.session_state.threshold).astype(int)
+
+    precision = precision_score(y, y_pred, zero_division=0)
+    recall = recall_score(y, y_pred, zero_division=0)
+    f1 = f1_score(y, y_pred, zero_division=0)
+    cm = confusion_matrix(y, y_pred)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Clientes avaliados", f"{len(df_out):,}".replace(",", "."))
-    c2.metric("Alto risco", int((df_out["risco"] == "Alto").sum()))
-    c3.metric("Médio risco", int((df_out["risco"] == "Médio").sum()))
-    c4.metric("Baixo risco", int((df_out["risco"] == "Baixo").sum()))
+    with c1: kpi_card("Precision", f"{precision:.2f}", "Dos marcados como risco, quantos eram churn")
+    with c2: kpi_card("Recall", f"{recall:.2f}", "Dos churns reais, quantos o modelo pegou")
+    with c3: kpi_card("F1-score", f"{f1:.2f}", "Equilíbrio entre precision e recall")
+    with c4: kpi_card("Limiar", f"{st.session_state.threshold:.2f}", "Trade-off principal")
 
-    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
-
-    st.markdown("### 🏆 Ranking de Prioridade — Top 50")
-    df_top50 = df_out.head(50).copy()
-    df_top50.insert(1, "badge_risco", df_top50["risco"].apply(lambda r: f"{risk_emoji(r)} {r}"))
-
-    cols_show = [
-        "customerID", "badge_risco", "prioridade_score", "prob_churn",
-        "Contract", "tenure", "MonthlyCharges", "PaymentMethod",
-        "acao", "canal", "oferta_sugerida"
-    ]
-    st.dataframe(df_top50[cols_show], width="stretch", hide_index=True)
-
-    st.markdown("### ⬇️ Exportações")
-    cexp1, cexp2 = st.columns(2)
-    with cexp1:
-        st.download_button(
-            "⬇️ Baixar TOP 50 (CSV)",
-            data=df_top50.to_csv(index=False).encode("utf-8"),
-            file_name=f"top50_prioridade_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-            mime="text/csv",
-            width="stretch"
-        )
-    with cexp2:
-        st.download_button(
-            "⬇️ Baixar BASE completa com risco (CSV)",
-            data=df_out.to_csv(index=False).encode("utf-8"),
-            file_name=f"clientes_risco_completo_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-            mime="text/csv",
-            width="stretch"
-        )
-
-    st.success("Batch scoring concluído ✅ Agora vá em **Plano de Ação** para gerar a lista do dia.")
-
-# =========================================================
-# 3) Plano de Ação
-# =========================================================
-elif menu == "📌 Plano de Ação":
-    st.subheader("📌 Plano de Ação — Lista do dia para o time de retenção")
-    st.caption("Baseado no último CSV processado no Batch Scoring.")
-
-    if st.session_state.last_batch is None:
-        st.warning("Ainda não há batch carregado. Vá em Batch Scoring e faça upload de uma base.")
-        st.stop()
-
-    df = st.session_state.last_batch.copy()
-
-    left, right = st.columns([2, 1])
-    with right:
-        capacidade = st.number_input("Capacidade diária (contatos)", min_value=5, max_value=500, value=50, step=5)
-        foco = st.multiselect("Foco de risco", ["Alto", "Médio", "Baixo"], default=["Alto"])
-        taxa_conversao = st.slider("Taxa estimada de retenção (%)", 5, 80, 30)
-        st.info("Sugestão: começar por **Alto** e depois preencher com **Médio** conforme capacidade.")
-
-    df_f = df[df["risco"].isin(foco)].copy()
-    df_f = df_f.sort_values(by=["prioridade_score", "prob_churn"], ascending=[False, False])
-
-    total_alto = int((df["risco"] == "Alto").sum())
-    total_medio = int((df["risco"] == "Médio").sum())
-    total_baixo = int((df["risco"] == "Baixo").sum())
-
-    df_today = df_f.head(int(capacidade)).copy()
-
-    receita_media = float(df_today["MonthlyCharges"].mean()) if len(df_today) > 0 else 0.0
-    churns_previstos = float(df_today["prob_churn"].sum()) if len(df_today) > 0 else 0.0
-    churns_evitar = churns_previstos * (taxa_conversao / 100)
-    receita_preservada = churns_evitar * receita_media
-
-    with left:
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Alto risco total", total_alto)
-        k2.metric("Contatos hoje", len(df_today))
-        k3.metric("Churn estimado no grupo", f"{churns_previstos:.1f}")
-        k4.metric("Receita potencial preservada", f"R$ {receita_preservada:,.0f}".replace(",", "."))
-
-    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
-
-    st.markdown("### 🏆 Lista do dia (prioridade máxima)")
-    if len(df_today) == 0:
-        st.warning("Não há clientes no filtro atual. Ajuste o foco de risco ou aumente a base.")
-    else:
-        df_today.insert(1, "badge_risco", df_today["risco"].apply(lambda r: f"{risk_emoji(r)} {r}"))
-        cols_show = [
-            "customerID", "badge_risco", "prioridade_score", "prob_churn",
-            "Contract", "tenure", "MonthlyCharges", "PaymentMethod",
-            "acao", "canal", "oferta_sugerida", "racional"
-        ]
-        st.dataframe(df_today[cols_show], width="stretch", hide_index=True)
-
-        st.markdown("### 📞 Lista resumida para CRM / WhatsApp")
-        texto_lista = ""
-        for _, row in df_today.iterrows():
-            texto_lista += (
-                f"{row['customerID']} | Risco: {row['risco']} | "
-                f"Ação: {row['acao']} | Oferta: {row['oferta_sugerida']}\n"
-            )
-
-        st.text_area("Copiar e colar no CRM:", value=texto_lista, height=220)
-
-        st.markdown("### ⬇️ Exportações")
-        cexp1, cexp2 = st.columns(2)
-
-        with cexp1:
-            st.download_button(
-                "⬇️ Baixar LISTA DO DIA (CSV)",
-                data=df_today.to_csv(index=False).encode("utf-8"),
-                file_name=f"lista_do_dia_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                mime="text/csv",
-                width="stretch"
-            )
-
-        with cexp2:
-            df_high = df[df["risco"] == "Alto"].copy()
-            st.download_button(
-                "⬇️ Baixar SOMENTE ALTO RISCO",
-                data=df_high.to_csv(index=False).encode("utf-8"),
-                file_name=f"alto_risco_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                mime="text/csv",
-                width="stretch"
-            )
-
-        st.success("Plano de ação pronto ✅ Lista gerada com impacto estimado.")
-
-# =========================================================
-# 4) Simulador (1 cliente)
-# =========================================================
-elif menu == "🧪 Simulador (1 cliente)":
-    st.subheader("🧪 Simulador — cliente individual (demo)")
-
-    gender = st.selectbox("gender", ["Female", "Male"])
-    senior = st.selectbox("SeniorCitizen", [0, 1])
-    partner = st.selectbox("Partner", ["Yes", "No"])
-    dependents = st.selectbox("Dependents", ["Yes", "No"])
-    tenure = st.number_input("tenure", min_value=0, max_value=120, value=12)
-    phone = st.selectbox("PhoneService", ["Yes", "No"])
-    multilines = st.selectbox("MultipleLines", ["No", "Yes", "No phone service"])
-    internet = st.selectbox("InternetService", ["DSL", "Fiber optic", "No"])
-    online_security = st.selectbox("OnlineSecurity", ["Yes", "No", "No internet service"])
-    online_backup = st.selectbox("OnlineBackup", ["Yes", "No", "No internet service"])
-    device_protection = st.selectbox("DeviceProtection", ["Yes", "No", "No internet service"])
-    tech_support = st.selectbox("TechSupport", ["Yes", "No", "No internet service"])
-    streaming_tv = st.selectbox("StreamingTV", ["Yes", "No", "No internet service"])
-    streaming_movies = st.selectbox("StreamingMovies", ["Yes", "No", "No internet service"])
-    contract = st.selectbox("Contract", ["Month-to-month", "One year", "Two year"])
-    paperless = st.selectbox("PaperlessBilling", ["Yes", "No"])
-    payment = st.selectbox(
-        "PaymentMethod",
-        ["Electronic check", "Mailed check", "Bank transfer (automatic)", "Credit card (automatic)"]
+    st.markdown("### Matriz de confusão (resumo)")
+    cm_df = pd.DataFrame(
+        cm,
+        index=["Real: Não churn", "Real: Churn"],
+        columns=["Prev: Não churn", "Prev: Churn"]
     )
-    monthly = st.number_input("MonthlyCharges", min_value=0.0, max_value=200.0, value=75.0, step=0.5)
-    total = st.number_input("TotalCharges", min_value=0.0, max_value=100000.0, value=1200.0, step=10.0)
+    st.dataframe(cm_df, use_container_width=True)
 
-    if st.button("✅ Calcular", width="stretch"):
-        raw = pd.DataFrame([{
-            "gender": gender,
-            "SeniorCitizen": int(senior),
-            "Partner": partner,
-            "Dependents": dependents,
-            "tenure": int(tenure),
-            "PhoneService": phone,
-            "MultipleLines": multilines,
-            "InternetService": internet,
-            "OnlineSecurity": online_security,
-            "OnlineBackup": online_backup,
-            "DeviceProtection": device_protection,
-            "TechSupport": tech_support,
-            "StreamingTV": streaming_tv,
-            "StreamingMovies": streaming_movies,
-            "Contract": contract,
-            "PaperlessBilling": paperless,
-            "PaymentMethod": payment,
-            "MonthlyCharges": float(monthly),
-            "TotalCharges": float(total),
-        }])
+    with st.expander("Ver relatório completo (classification report)"):
+        st.text(classification_report(y, y_pred, zero_division=0))
 
-        X = build_encoded(raw)
-        prob = float(model.predict_proba(X)[0][1])
-        bucket = risk_bucket(prob)
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Prob. churn", f"{prob*100:.1f}%")
-        c2.metric("Risco", f"{risk_emoji(bucket)} {bucket}")
-        c3.metric("Classe (threshold)", "Churn" if prob >= threshold else "Não churn")
-        c4.metric("Prioridade score", f"{priority_score(prob, tenure, contract, monthly):.1f}")
-
-        pb = playbook_row(prob, contract, int(tenure), float(monthly), payment)
-        st.info(f"**Playbook:** {pb['acao']} • {pb['canal']} • {pb['oferta_sugerida']} \n\n**Racional:** {pb['racional']}")
-
-        with st.expander("🧠 Top fatores (se for Regressão Logística)"):
-            df_factors = explain_logreg_top_factors(X, top_n=8)
-            if df_factors.empty:
-                st.write("Este modelo não expõe coeficientes para explicação (ou não é Regressão Logística).")
-            else:
-                st.dataframe(df_factors, width="stretch", hide_index=True)
-
-# =========================================================
-# 5) Dashboard
-# =========================================================
-elif menu == "📊 Dashboard":
-    st.subheader("📊 Dashboard — drivers do churn (EDA)")
-
-    if not dataset_loaded:
-        st.warning("Não consegui carregar o dataset. Coloque o CSV na pasta do app.")
+    st.markdown("### Top drivers do modelo (features)")
+    imp = extract_feature_importance(model, model_cols)
+    if imp is None:
+        st.info("Seu modelo não expõe feature importance/coeficientes. Se quiser, eu te mostro como trocar por um modelo explicável (sem perder deploy).")
     else:
-        churn_rate = df_data["Churn_num"].mean()
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Clientes", f"{len(df_data):,}".replace(",", "."))
-        k2.metric("Taxa de churn", f"{churn_rate*100:.1f}%")
-        k3.metric("Tenure médio", f"{df_data['tenure'].mean():.1f} meses")
-        k4.metric("MonthlyCharges médio", f"{df_data['MonthlyCharges'].mean():.2f}")
+        top = imp.head(15).reset_index()
+        top.columns = ["feature", "importancia"]
+        st.dataframe(top, use_container_width=True)
+        st.bar_chart(top.set_index("feature")["importancia"])
 
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("### Churn por contrato")
-            churn_by_contract = df_data.groupby("Contract")["Churn_num"].mean().sort_values(ascending=False).reset_index()
-            churn_by_contract["churn_%"] = churn_by_contract["Churn_num"] * 100
-            st.dataframe(churn_by_contract[["Contract", "churn_%"]], width="stretch", hide_index=True)
-            st.bar_chart(churn_by_contract.set_index("Contract")["churn_%"])
-        with c2:
-            st.markdown("### Churn por faixa de tenure")
-            bins = [-1, 6, 12, 24, 48, 1000]
-            labels = ["0-6", "7-12", "13-24", "25-48", "49+"]
-            tmp = df_data.copy()
-            tmp["tenure_faixa"] = pd.cut(tmp["tenure"], bins=bins, labels=labels)
-            churn_by_tenure = tmp.groupby("tenure_faixa")["Churn_num"].mean().reset_index()
-            churn_by_tenure["churn_%"] = churn_by_tenure["Churn_num"] * 100
-            st.dataframe(churn_by_tenure, width="stretch", hide_index=True)
-            st.line_chart(churn_by_tenure.set_index("tenure_faixa")["churn_%"])
+    st.markdown("### Comparador de cenários — limiar x ROI")
+    st.caption("Você usa isso em entrevista pra explicar trade-off: mais recall = mais ações = mais custo; mais precision = menos desperdício.")
 
-# =========================================================
-# 6) Histórico
-# =========================================================
-elif menu == "🗂 Histórico":
-    st.subheader("🗂 Histórico de simulações")
+    # Premissas ROI
+    colA, colB, colC = st.columns(3)
+    with colA:
+        horizonte = st.number_input("Horizonte (meses) [cenários]", 1, 36, 12, 1, key="hz2")
+    with colB:
+        sucesso = st.number_input("Sucesso da retenção (%) [cenários]", 1, 100, 20, 1, key="sx2") / 100
+    with colC:
+        custo_acao = st.number_input("Custo por ação (R$) [cenários]", 0.0, 500.0, 12.0, 1.0, key="ca2")
 
-    if len(st.session_state.history) == 0:
-        st.write("Sem histórico ainda. Use o Simulador.")
-    else:
-        df_hist = pd.DataFrame(st.session_state.history)
-        st.dataframe(df_hist, width="stretch", hide_index=True)
-        st.download_button(
-            "⬇️ Baixar histórico (CSV)",
-            data=df_hist.to_csv(index=False).encode("utf-8"),
-            file_name="historico_simulacoes.csv",
-            mime="text/csv",
-            width="stretch"
-        )
-        if st.button("🧹 Limpar histórico", width="stretch"):
-            st.session_state.history = []
-            st.success("Histórico limpo ✅")
+    thresholds = [0.30, 0.50, 0.70]
+    rows = []
+    monthly = X_raw["MonthlyCharges"].fillna(0).values if "MonthlyCharges" in X_raw.columns else np.zeros(len(X_raw))
+
+    for t in thresholds:
+        yp = (proba >= t).astype(int)
+        prec_t = precision_score(y, yp, zero_division=0)
+        rec_t = recall_score(y, yp, zero_division=0)
+        f1_t = f1_score(y, yp, zero_division=0)
+
+        # ROI simples:
+        # ações = todos marcados como risco
+        acoes = int(yp.sum())
+        receita = monthly[yp == 1].sum() * horizonte * sucesso
+        custo = acoes * custo_acao
+        roi_t = (receita - custo) / (custo + 1e-9)
+
+        rows.append({
+            "limiar": t,
+            "precision": round(prec_t, 3),
+            "recall": round(rec_t, 3),
+            "f1": round(f1_t, 3),
+            "ações": acoes,
+            "receita_salva_est": round(receita, 0),
+            "custo_est": round(custo, 0),
+            "ROI(x)": round(roi_t, 2),
+        })
+
+    scen = pd.DataFrame(rows).sort_values("limiar")
+    st.dataframe(scen, use_container_width=True)
+
+def page_historico():
+    st.header("🗂 Histórico — simulações e execuções")
+    st.markdown('<p class="small-muted">Registre evidências: o que foi simulado, quais decisões, qual limiar.</p>', unsafe_allow_html=True)
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("### Simulações individuais")
+        if len(st.session_state.sim_history) == 0:
+            st.info("Sem histórico ainda. Use **🧪 Simulação Individual**.")
+        else:
+            hist = pd.DataFrame(st.session_state.sim_history)
+            st.dataframe(hist.tail(30), use_container_width=True)
+
+    with col2:
+        st.markdown("### Último ranking (batch)")
+        if st.session_state.last_batch_scored is None:
+            st.info("Nenhum ranking ainda. Use **🎯 Priorização Inteligente**.")
+        else:
+            st.dataframe(st.session_state.last_batch_scored.head(20), use_container_width=True)
+
+
+# =========================
+# Render
+# =========================
+if page == "📊 Visão Executiva":
+    page_executiva()
+elif page == "📥 Upload de Base":
+    page_upload()
+elif page == "🎯 Priorização Inteligente":
+    page_priorizacao()
+elif page == "🧪 Simulação Individual":
+    page_simulacao()
+elif page == "💰 Impacto Financeiro":
+    page_impacto()
+elif page == "📈 Análise Estratégica":
+    page_analise()
+elif page == "🗂 Histórico":
+    page_historico()
