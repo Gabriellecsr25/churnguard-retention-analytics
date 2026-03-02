@@ -85,9 +85,7 @@ def load_model_and_columns():
 
 @st.cache_data
 def load_telco_dataset():
-    # Dataset original do seu repo
     df = pd.read_csv("WA_Fn-UseC_-Telco-Customer-Churn.csv")
-    # ajustes comuns
     if "TotalCharges" in df.columns:
         df["TotalCharges"] = pd.to_numeric(df["TotalCharges"], errors="coerce")
     df = df.dropna(subset=["TotalCharges"]).copy()
@@ -150,7 +148,6 @@ def extract_feature_importance(model, feature_names):
         return s
     if hasattr(model, "coef_"):
         coef = model.coef_
-        # binário: shape (1, n_features)
         if len(coef.shape) == 2 and coef.shape[0] == 1:
             coef = coef[0]
         s = pd.Series(np.abs(coef), index=feature_names).sort_values(ascending=False)
@@ -160,12 +157,26 @@ def extract_feature_importance(model, feature_names):
 def predict_proba_from_input(df_input_processed: pd.DataFrame) -> np.ndarray:
     if hasattr(model, "predict_proba"):
         return model.predict_proba(df_input_processed)[:, 1]
-    # fallback: decision_function -> sigmoid aproximado
     if hasattr(model, "decision_function"):
         z = model.decision_function(df_input_processed)
         return 1 / (1 + np.exp(-z))
-    # último caso: só predict (0/1)
     return model.predict(df_input_processed).astype(float)
+
+def drop_leak_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove colunas que não devem entrar na pontuação."""
+    df2 = df.copy()
+    for col in ["Churn", "customerID"]:
+        if col in df2.columns:
+            df2 = df2.drop(columns=[col])
+    return df2
+
+def coerce_numeric_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Garante conversão dos numéricos principais, quando existirem."""
+    df2 = df.copy()
+    for c in ["tenure", "MonthlyCharges", "TotalCharges", "SeniorCitizen"]:
+        if c in df2.columns:
+            df2[c] = pd.to_numeric(df2[c], errors="coerce")
+    return df2
 
 # =========================
 # Traduções (UI PT -> valores EN que o modelo espera)
@@ -195,7 +206,6 @@ UI = {
 }
 
 def build_single_customer_input():
-    # Campos essenciais do dataset original
     col1, col2 = st.columns(2)
 
     with col1:
@@ -226,7 +236,6 @@ def build_single_customer_input():
         monthly = st.number_input("Mensalidade (MonthlyCharges)", min_value=0.0, max_value=500.0, value=75.0, step=1.0)
         total = st.number_input("Total pago (TotalCharges)", min_value=0.0, max_value=100000.0, value=1200.0, step=10.0)
 
-    # Monta registro no formato original (EN), como no dataset
     record = {
         "gender": UI["Sexo"][gender_pt],
         "SeniorCitizen": UI["Idoso (Senior)"][senior_pt],
@@ -257,10 +266,10 @@ if "threshold" not in st.session_state:
     st.session_state.threshold = 0.50
 
 if "last_batch_scored" not in st.session_state:
-    st.session_state.last_batch_scored = None  # dataframe com score
+    st.session_state.last_batch_scored = None
 
 if "sim_history" not in st.session_state:
-    st.session_state.sim_history = []  # lista de dicts
+    st.session_state.sim_history = []
 
 # =========================
 # Sidebar - Identidade + Navegação
@@ -329,16 +338,12 @@ def page_upload():
         return
 
     df = pd.read_csv(uploaded)
-    # ajustes comuns
-    if "TotalCharges" in df.columns:
-        df["TotalCharges"] = pd.to_numeric(df["TotalCharges"], errors="coerce")
+    df = coerce_numeric_cols(df)
 
     st.write("Prévia da base:")
     st.dataframe(df.head(20), use_container_width=True)
 
     st.success("Base carregada. Agora vá em **🎯 Priorização Inteligente** para gerar ranking e ações.")
-
-    # guarda no estado
     st.session_state.upload_df = df
 
 def page_priorizacao():
@@ -350,12 +355,12 @@ def page_priorizacao():
         return
 
     df = st.session_state.upload_df.copy()
+    df = coerce_numeric_cols(df)
+    df_feat = drop_leak_cols(df)
 
-    # Pré-processamento rápido: one-hot no padrão do treino (assumindo que colunas_modelo.pkl é o pós-encoding)
-    # Aqui usamos get_dummies para aproximar o pipeline.
-    # Se seu modelo foi treinado com pipeline diferente, a gente ajusta depois.
-    cat_cols = df.select_dtypes(include=["object"]).columns.tolist()
-    df_enc = pd.get_dummies(df, columns=cat_cols, drop_first=False)
+    # One-hot (mesmo estilo usado no app anterior)
+    cat_cols = df_feat.select_dtypes(include=["object"]).columns.tolist()
+    df_enc = pd.get_dummies(df_feat, columns=cat_cols, drop_first=False)
 
     X = to_model_frame(df_enc, model_cols)
     proba = predict_proba_from_input(X)
@@ -364,10 +369,8 @@ def page_priorizacao():
     out["risco_churn"] = proba
     out["classificacao"] = np.where(out["risco_churn"] >= st.session_state.threshold, "ALTO RISCO", "baixo risco")
 
-    # Playbook simples (negócio) — você pode refinar depois
     def suggest_action(row):
-        risk = row["risco_churn"]
-        monthly = row["MonthlyCharges"] if "MonthlyCharges" in row else np.nan
+        risk = float(row["risco_churn"])
         contract = row["Contract"] if "Contract" in row else ""
         if risk >= 0.80:
             return "Oferta forte + contato humano (prioridade máxima)"
@@ -380,7 +383,6 @@ def page_priorizacao():
         return "Acompanhamento (nurturing) / sem ação"
 
     out["acao_recomendada"] = out.apply(suggest_action, axis=1)
-
     out = out.sort_values("risco_churn", ascending=False).reset_index(drop=True)
 
     st.session_state.last_batch_scored = out
@@ -406,12 +408,16 @@ def page_priorizacao():
 
 def page_simulacao():
     st.header("🧪 Simulação Individual — cliente único")
-    st.markdown('<p class="small-muted">Preencha os dados do cliente e veja risco + recomendação. Tudo em português (sem quebrar o modelo).</p>', unsafe_allow_html=True)
+    st.markdown('<p class="small-muted">Preencha os dados do cliente e veja risco + recomendação. Tudo em português.</p>', unsafe_allow_html=True)
 
     df_one = build_single_customer_input()
+    df_one = coerce_numeric_cols(df_one)
 
-    # one-hot igual ao batch
-    df_enc = pd.get_dummies(df_one, columns=df_one.select_dtypes(include=["object"]).columns.tolist(), drop_first=False)
+    df_enc = pd.get_dummies(
+        df_one,
+        columns=df_one.select_dtypes(include=["object"]).columns.tolist(),
+        drop_first=False
+    )
     X = to_model_frame(df_enc, model_cols)
 
     if st.button("✅ Calcular risco"):
@@ -433,7 +439,6 @@ def page_simulacao():
         else:
             st.info("Ação sugerida: **nurturing** (acompanhar, ofertas leves, melhoria de experiência).")
 
-        # salva histórico
         st.session_state.sim_history.append({
             "risco_churn": proba,
             "classificacao": label,
@@ -442,7 +447,7 @@ def page_simulacao():
 
 def page_impacto():
     st.header("💰 Impacto Financeiro — estimativa de receita salva")
-    st.markdown('<p class="small-muted">Aqui é onde você vira “contratável”: traduz modelo em dinheiro.</p>', unsafe_allow_html=True)
+    st.markdown('<p class="small-muted">Aqui você traduz modelo em dinheiro.</p>', unsafe_allow_html=True)
 
     if st.session_state.last_batch_scored is None:
         st.warning("Você ainda não gerou um ranking. Vá em **🎯 Priorização Inteligente**.")
@@ -450,7 +455,7 @@ def page_impacto():
 
     out = st.session_state.last_batch_scored.copy()
 
-    st.markdown("### Premissas (ajuste como em um caso real)")
+    st.markdown("### Premissas")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         horizonte_meses = st.number_input("Horizonte (meses)", 1, 36, 12, 1)
@@ -461,7 +466,6 @@ def page_impacto():
     with c4:
         qtd_acoes = st.number_input("Qtd. de clientes que você consegue acionar", 1, 5000, 300, 10)
 
-    # pega top N de alto risco
     alto = out[out["classificacao"] == "ALTO RISCO"].head(int(qtd_acoes)).copy()
     if "MonthlyCharges" not in alto.columns:
         st.error("Sua base não tem 'MonthlyCharges'. Sem isso não dá para estimar receita salva.")
@@ -484,7 +488,7 @@ def page_impacto():
 
 def page_analise():
     st.header("📈 Análise Estratégica — métricas + drivers + cenários")
-    st.markdown('<p class="small-muted">Aqui você mostra maturidade: qualidade do modelo + explicabilidade + trade-off do limiar.</p>', unsafe_allow_html=True)
+    st.markdown('<p class="small-muted">Qualidade do modelo + explicabilidade + trade-off do limiar.</p>', unsafe_allow_html=True)
 
     if telco_df is None:
         st.warning("Sem o CSV Telco carregado. Confirme se 'WA_Fn-UseC_-Telco-Customer-Churn.csv' está no repo.")
@@ -497,10 +501,8 @@ def page_analise():
 
     y = (df["Churn"] == "Yes").astype(int)
 
-    X_raw = df.drop(columns=["Churn"])
-    # remove id se existir
-    if "customerID" in X_raw.columns:
-        X_raw = X_raw.drop(columns=["customerID"])
+    X_raw = drop_leak_cols(df)  # remove Churn/customerID
+    X_raw = coerce_numeric_cols(X_raw)
 
     cat_cols = X_raw.select_dtypes(include=["object"]).columns.tolist()
     X_enc = pd.get_dummies(X_raw, columns=cat_cols, drop_first=False)
@@ -520,7 +522,7 @@ def page_analise():
     with c3: kpi_card("F1-score", f"{f1:.2f}", "Equilíbrio entre precision e recall")
     with c4: kpi_card("Limiar", f"{st.session_state.threshold:.2f}", "Trade-off principal")
 
-    st.markdown("### Matriz de confusão (resumo)")
+    st.markdown("### Matriz de confusão")
     cm_df = pd.DataFrame(
         cm,
         index=["Real: Não churn", "Real: Churn"],
@@ -534,7 +536,7 @@ def page_analise():
     st.markdown("### Top drivers do modelo (features)")
     imp = extract_feature_importance(model, model_cols)
     if imp is None:
-        st.info("Seu modelo não expõe feature importance/coeficientes. Se quiser, eu te mostro como trocar por um modelo explicável (sem perder deploy).")
+        st.info("Seu modelo não expõe feature importance/coeficientes.")
     else:
         top = imp.head(15).reset_index()
         top.columns = ["feature", "importancia"]
@@ -542,9 +544,6 @@ def page_analise():
         st.bar_chart(top.set_index("feature")["importancia"])
 
     st.markdown("### Comparador de cenários — limiar x ROI")
-    st.caption("Você usa isso em entrevista pra explicar trade-off: mais recall = mais ações = mais custo; mais precision = menos desperdício.")
-
-    # Premissas ROI
     colA, colB, colC = st.columns(3)
     with colA:
         horizonte = st.number_input("Horizonte (meses) [cenários]", 1, 36, 12, 1, key="hz2")
@@ -563,8 +562,6 @@ def page_analise():
         rec_t = recall_score(y, yp, zero_division=0)
         f1_t = f1_score(y, yp, zero_division=0)
 
-        # ROI simples:
-        # ações = todos marcados como risco
         acoes = int(yp.sum())
         receita = monthly[yp == 1].sum() * horizonte * sucesso
         custo = acoes * custo_acao
@@ -604,7 +601,6 @@ def page_historico():
             st.info("Nenhum ranking ainda. Use **🎯 Priorização Inteligente**.")
         else:
             st.dataframe(st.session_state.last_batch_scored.head(20), use_container_width=True)
-
 
 # =========================
 # Render
