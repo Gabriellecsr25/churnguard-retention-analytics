@@ -127,13 +127,22 @@ def kpi_card(title, value, sub=""):
 def to_model_frame(raw_df: pd.DataFrame, expected_cols: list[str]) -> pd.DataFrame:
     """
     Ajusta o dataframe para ter exatamente as colunas esperadas pelo modelo,
-    criando colunas faltantes com 0 e removendo extras.
+    cria colunas faltantes com 0, remove extras e garante que não existam NaN/Inf.
     """
     df = raw_df.copy()
+
+    # cria faltantes
     for c in expected_cols:
         if c not in df.columns:
             df[c] = 0
+
+    # mantém só as esperadas
     df = df[expected_cols]
+
+    # garante numérico + remove NaN/Inf
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.fillna(0)
+
     return df
 
 def extract_feature_importance(model, feature_names):
